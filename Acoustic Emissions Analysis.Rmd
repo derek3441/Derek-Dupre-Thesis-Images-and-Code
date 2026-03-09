@@ -1,0 +1,1729 @@
+Include Libraries
+
+```{r}
+library (dplyr)
+library (tidyverse)
+library (ggplot2)
+library (ggExtra)
+library (ggside)
+library (ggforce)
+library (gridExtra)
+library (patchwork)
+library (lubridate)
+library (scales)
+library (purrr)
+library (ggtext)
+```
+
+Variables
+
+```{r}
+#common variables
+teststartload = 1e-2 #10mN
+picturewidth = 6 #units in Inches
+pictureheight = 4 #units in Inches
+bincount = 80 #20 for 5N if bins at quarter newton
+savepath = "./Graphs"
+
+colpal <- colorRampPalette(c("red", "orange", "yellow", "green", "blue", "purple"))
+shapes_3 <- c(21,24,22)
+lines_3 <- c("solid", "dashed", "dotted")
+```
+
+Setup
+
+```{r}
+sample = "SiC Stats"
+undertitle = paste("From", sample, "Testing")
+```
+
+Useful Functions
+
+```{r}
+reindex <- function(df){
+  rownames(df) <- 1:nrow(df)
+  return(df)
+}
+```
+
+Data Reading and Processing
+
+```{r}
+filestolist <- function(folderdir,
+                        loadstart = 1e-2,
+                        plotcount = 20,
+                        indent = 1,
+                        uniquenames = FALSE) {
+  
+  directories <- 
+    list.files(folderdir, pattern = ".csv$", recursive = TRUE, full.names = TRUE)
+  
+  filenames <- 
+    list.files(folderdir, pattern = ".csv$", recursive = TRUE, full.names = FALSE)
+  
+  datalist <- 
+    lapply(directories, read.csv)
+  
+  if(!uniquenames) {
+    
+    names(datalist) <- 
+      gsub("\\.csv$", "", filenames)
+    
+    } else {
+      
+    names(datalist) <- 
+      gsub("\\.csv$", "", gsub("^\\.\\/DataFiles\\/", "", directories))
+    
+  }
+  
+  datalistclean <- 
+    map(datalist, ~ .x %>% 
+          mutate(
+            Time..min. = Time..min. - Time..min.[which.max(Load..N.>loadstart)],
+            Depth..µm. = Depth..µm. - Depth..µm.[which.max(Load..N.>loadstart)],
+            )
+        )
+  
+  datalistclean <- 
+    map(datalistclean, ~ .x %>% 
+          filter(
+            Time..min. > 0,
+            Time..min. < Time..min.[which.max(Load..N.)]
+            )
+        )
+  
+  selecteddata <- indent:min(plotcount + indent - 1, length(datalistclean))
+  
+  list(
+    name = basename(normalizePath(folderdir)),
+    datalist = datalist,
+    datalistclean = datalistclean,
+    selecteddata = selecteddata
+  )
+  
+}
+```
+
+Extrapolate Data
+
+Main Data Conditioning Function
+
+```{r}
+dfcond <- function(df, df_clean, source = NA, noiseoff = 0, loadstart = 1e-2) {
+  
+  idx <- 1:which.max(df[3] > loadstart)
+  
+  #noise metrics
+  AEnoise <- mean(df[idx, 5])
+  Noisefloor <- max(df[idx, 5]) + noiseoff
+  
+  #peak extraction
+  peak_idx <- which(df_clean[5] > Noisefloor)
+  
+  peakheight <- df_clean[peak_idx, 5] - AEnoise
+  peakload <- df_clean[peak_idx, 3]
+  peakdepth <- df_clean[peak_idx, 2]
+  
+  #remove duplicates
+  dupes <- duplicated(peakheight)
+  
+  if(any(dupes)){
+    peakheight <- peakheight[!dupes]
+    peakload <- peakload[!dupes]
+    peakdepth <- peakdepth[!dupes]
+  }
+  
+  #recreate indentdf row
+  indentrow <- data.frame(
+    n_peaks = length(peakheight),
+    mean_AE = mean(peakheight),
+    total_AE = sum(peakheight),
+    first_AE = peakheight[1],
+    first_load = peakload[1],
+    Source = source
+  )
+  
+  list(
+    AEnoise = AEnoise,
+    Noisefloor = Noisefloor,
+    peakheight = peakheight,
+    peakload = peakload,
+    peakdepth = peakdepth,
+    indentdfrow = indentrow
+  )
+  
+}
+
+makedfcond <- function(df, dfclean, noiseoff, loadstart){
+  
+  source = lapply(strsplit(names(dfclean), "/"), '[[', 1)
+  
+  pmap(list(df, dfclean, source), dfcond, noiseoff, loadstart)
+}
+```
+
+Readjust data considering new values (AEnoise)
+
+```{r}
+readjust <- function(df, cond) {
+  df %>% 
+    mutate(AE_adj = Acoustic..aJ. - cond$AEnoise)
+  }
+```
+
+Create Peaksdf, contains all peak data
+
+```{r}
+#function to create peaksdf
+peaksdfrow <- function(df, source = NA){
+  
+  if(length(df$peakheight) > 0){
+    
+    dfrow <- data.frame(
+      AE = df$peakheight,
+      Load = df$peakload,
+      Depth = df$peakdepth,
+      PeakNumber = 1:length(df$peakheight),
+      Source = source)
+    
+  } else {
+    
+    dfrow <- data.frame(
+      AE = NULL,
+      Load = NULL,
+      Depth = NULL,
+      PeakNumber = NULL,
+      Source = NULL)
+    }
+}
+
+makepeaksdf <- function(dfcond){
+  reindex(
+    bind_rows(
+      map2(dfcond, 
+        lapply(strsplit(names(dfcond), "/"), '[[', 1), peaksdfrow)))
+}
+```
+
+Data Processing Function Calls
+
+```{r}
+datamaster <- filestolist(folderdir = "./DataFiles/Sic Stats Final", 
+                          loadstart = 1e-1)
+
+datalist <- datamaster[[2]]
+datalistclean <- datamaster[[3]]
+selecteddata <- datamaster[[4]]
+
+datacond <- makedfcond(datalist, datalistclean, noiseoff = 600, loadstart = 1e-1)
+
+datalistclean <- map2(datalistclean, datacond, readjust)
+
+indentdf <- reindex(do.call(rbind, lapply(datacond, `[[`, "indentdfrow")))
+
+peaksdf <- makepeaksdf(datacond)
+```
+
+Do after Main Conditioning Loop
+
+```{r}
+#Code which requires extrapolation done in Main Data Conditioning Loop
+
+#find maximum load
+loadmax = round(max(datalistclean[[100]][3]))
+
+#find gradations of bins from bincount and maximum load
+binloads = ((0:bincount)/bincount)*loadmax
+
+#determine average noise level and noise floor for graphs
+AEnoise = mean(sapply(datacond, `[[`, "AEnoise"))
+Noisefloor = mean(sapply(datacond, `[[`, "Noisefloor"))
+```
+
+Peak Data Stats for Consistency Plot
+
+```{r}
+makestats<- function(pdf){
+  stats <- na.omit(
+    pdf %>% 
+  group_by(PeakNumber) %>% 
+  summarize(
+    sdload = sd(Load),
+    sddepth = sd(Depth),
+    meanAE = mean(AE),
+    meanLoad = mean(Load),
+    meanDepth = mean(Depth)))
+  
+  stats
+}
+
+peaknumstats <- makestats(peaksdf)
+```
+
+Graph Data
+
+AE vs Depth
+
+```{r}
+#Graph AE vs Depth for each indent
+ggplot(
+  bind_rows(
+    datalistclean[selecteddata],
+    .id = "Test"), 
+  aes(x = Depth..µm., 
+      y = AE_adj, 
+      colour=Test)) +
+  
+  geom_path() +
+  
+  geom_hline(yintercept=Noisefloor, linetype="longdash", col = 'black')+
+  
+  annotate("text", 
+           x = 1, 
+           y = Noisefloor, 
+           label = "Noise Floor", 
+           vjust = -1,
+           col = "black") +
+  
+  scale_y_continuous(labels = scales::number) +
+  
+  labs(x = "Depth (µm)", 
+       y = "Acoustic Energy (aJ)",) +
+  
+  theme_bw() +
+  theme(legend.position = "none")
+
+ggsave(
+  paste0(savepath, "/AEDepth/", sample, " Acoustic Energy vs Depth.png"), 
+  width = picturewidth, height = pictureheight
+  )
+```
+
+AE vs Time
+
+```{r}
+#Graph AE vs Time for each indent
+ggplot(
+  bind_rows(
+    datalistclean[selecteddata],
+    .id = "Test"),
+  aes(x = Time..min. * 60, 
+      y = AE_adj,
+      colour=Test)) +
+  
+  geom_path() +
+  
+  geom_hline(yintercept=Noisefloor, linetype="longdash", col = "black")+
+  annotate("text", 
+           x = max(datalistclean[[1]][1]) * 45, 
+           y = Noisefloor, 
+           label = "Noise Floor", 
+           vjust = -1,
+           col = "black") +
+  
+  
+  labs(x = "Time (Sec)", 
+       y = "Acoustic Energy (aJ)",) +
+  
+  scale_y_continuous(labels = scales::number) +
+  
+  theme_bw() +
+  theme(legend.position = "none")
+
+ggsave(
+  paste0(savepath, "/AETime/", sample, " Acoustic Energy vs Time.png"), 
+  width = picturewidth, height = pictureheight
+  )
+```
+
+Load vs Depth
+
+```{r}
+#Graph Load vs Depth for each indent
+ggplot(
+  bind_rows(
+    datalistclean[selecteddata], 
+    .id = "Test"), 
+  aes(x = Depth..µm., 
+      y = Load..N., 
+      colour=Test)) +
+  
+  labs(x = "Depth (µm)", 
+       y = "Load (N)",) +
+  
+  geom_path() +
+  
+  scale_y_continuous(limits = c(0, loadmax)) +
+  
+  theme_bw() +
+  theme(legend.position = "none")
+
+ggsave(
+  paste0(savepath, "/DepthLoad/", sample,"Load vs Depth.png"), 
+  width = picturewidth, height = pictureheight
+)
+```
+
+AE vs Depth with Load vs Depth
+
+```{r}
+#Graph AE vs Depth AND Load vs. Depth on a single indent (determined by plotstart)
+#scales second axis properly such that max load and max AE are at same height
+plotstart = selecteddata[[1]]
+
+scale =
+  (max(datalistclean[[plotstart]][5]) - datacond[[plotstart]]$AEnoise)/
+  max(datalistclean[[plotstart]][3])
+
+ggplot() +
+  
+  geom_path(data = datalistclean[[plotstart]], 
+            aes(
+              x=Depth..µm., 
+              y=Acoustic..aJ.- datacond[[plotstart]]$AEnoise), 
+            color = "black") +
+  
+  geom_path(data = datalistclean[[plotstart]], 
+            aes(
+              x=Depth..µm., 
+              y=Load..N.*scale), 
+            color = "red2") +
+  
+  geom_hline(
+    yintercept = 
+      datacond[[plotstart]]$Noisefloor - 
+      datacond[[plotstart]]$AEnoise, 
+    linetype="longdash", 
+    col = 'black')+
+  
+  annotate("text", 
+           x = .75, 
+           y = datacond[[plotstart]]$Noisefloor - datacond[[plotstart]]$AEnoise, 
+           label = "Noise Floor", 
+           vjust = -0.75) +
+  
+  labs(subtitle=paste(undertitle, "Indent", plotstart, sep = " "), 
+       x = "Depth (µm)") +
+  
+  scale_y_continuous(name = "Acoustic Energy (aJ)", 
+                     sec.axis = sec_axis(~.*1/scale, name = "Load (N)")) +
+  
+  coord_cartesian(ylim = c(0,12500)) +
+  theme_bw() +
+  theme(axis.title.y.right = element_text(color = "red2"))
+
+ggsave(
+  paste0(savepath, "/AELoadDepth/", sample, "indent", plotstart, "AELoad Overlay.png"), 
+  width = picturewidth, height = pictureheight
+)
+```
+
+Distribution plot
+
+Dist plot Variables and Aesthetics
+
+```{r}
+ymax = 10^(floor(max(log10(peaksdf$AE))))
+ymin = min(peaksdf$AE)
+xmax = round(loadmax)
+xmin = 0
+bins = 50
+densityscale = 20
+transparency = 0.2
+groups <- 10
+colors <- colpal(groups)
+```
+
+Empty Plot for Pasting
+
+```{r}
+empty <- ggplot()+
+         theme(axis.ticks=element_blank(), 
+               panel.background=element_blank(), 
+               axis.text.x=element_blank(), axis.text.y=element_blank(),           
+               axis.title.x=element_blank(), axis.title.y=element_blank())
+```
+
+Consistency Plot
+
+```{r}
+statsplot <- ggplot() +
+  
+  geom_point(data = peaksdf %>% filter(Load <= xmax & PeakNumber <= groups), 
+             aes(
+               x = Load, 
+               y = AE,
+               shape = factor(PeakNumber),
+               fill = factor(PeakNumber)),
+             color = "black",
+             alpha = transparency,
+             size = 2) +
+  
+  geom_point(data = peaknumstats %>% filter(PeakNumber <= groups),
+             aes(
+               x = meanLoad,
+               y = meanAE,
+               shape = factor(PeakNumber),
+               fill = factor(PeakNumber)),
+             color = "black",
+             size = 3) +
+  
+  geom_errorbarh(data = peaknumstats %>% filter(PeakNumber <= groups),
+                aes(
+                  y = meanAE,
+                  xmin = meanLoad - sdload,
+                  xmax = meanLoad + sdload,
+                )) +
+  
+  scale_shape_manual(name = paste0("Peak", "\n", "Number"), values = rep(shapes_3, length.out = groups)) +
+  scale_fill_manual(name = paste0("Peak", "\n", "Number"), values = colors) +
+  scale_color_manual(name = paste0("Peak", "\n", "Number"), values = colors) +
+  
+  labs(x = "Load (N)", 
+       y = "Acoustic Energy (aJ)") +
+
+  coord_cartesian(xlim = c(xmin, xmax), ylim = c(ymin, ymax)) +
+  
+  scale_y_continuous(trans = "log10", labels = scales::label_log()) +
+  
+  theme_bw()
+
+ggsave(
+  paste0(savepath,"/firstpeaksplot/", sample, " First Peaks Average.png"), 
+  width = picturewidth, height = pictureheight
+)
+
+statsplot
+```
+
+X (load) distribution plot
+
+```{r}
+xdistributioncolor <- ggplot() +
+  
+  # geom_histogram(data = peaksdf %>% filter(Load <= xmax & PeakNumber <= groups),
+  #                aes(
+  #                  x = Load,
+  #                  fill = factor(PeakNumber)),
+  #                alpha = 0.5,
+  #                bins = bins) +
+  
+  geom_histogram(data = peaksdf %>% filter(Load <= xmax & PeakNumber <= groups),
+                 aes(
+                   x = Load),
+                   fill = "darkgrey",
+                 alpha = 0.5,
+                 bins = bins) +
+  
+  geom_density(data = peaksdf %>% filter(Load <= xmax & PeakNumber <= groups),
+               aes(
+                 x = Load,
+                 y = after_stat(scaled) * densityscale,
+#                 linetype = factor(PeakNumber),
+                 color = factor(PeakNumber))) +
+  
+  coord_cartesian(xlim = c(xmin, xmax))+
+  
+  labs(x = "Load (N)", 
+       y = "Count / Density") +
+  
+#  scale_linetype_manual(name = "Legend", values = rep(lines_3, length.out = groups)) +
+  scale_fill_manual(name = "Legend", values = colors) +
+  scale_color_manual(name = "Legend", values = colors) +
+    
+  theme_bw()
+
+ggsave(
+  paste0(savepath,"/distribution/", sample, " Load distribution colored.png"), 
+  width = picturewidth, height = pictureheight
+)
+
+xdistributioncolor
+```
+
+Y (AE) distribution plot
+
+```{r}
+ydistribution <- ggplot() +
+  
+  geom_histogram(data = peaksdf %>% filter(Load <= xmax & PeakNumber <= groups & AE <= ymax),
+                 aes(x = AE),
+                 bins = bins,
+                 fill = "darkgrey",
+                 alpha = 0.5) +
+  
+  # geom_histogram(data = peaksdf %>% filter(Load <= xmax & PeakNumber <= groups),
+  #                aes(x = AE,
+  #                    fill = factor(PeakNumber)),
+  #                bins = bins,
+  #                alpha = 0.5) +
+  # 
+  # scale_fill_manual(name = "Legend", values = colors) +
+  
+  # scale_x_continuous(labels = scales::label_log()) +
+  
+  coord_cartesian(xlim = c(ymin, ymax)) +
+  
+  labs(x = "Acoustic Energy (aJ)", 
+       y = "Count") +
+  
+  theme_bw()
+
+ggsave(
+  paste0(savepath,"/distribution/", sample, " AE distribution.png"), 
+  width = picturewidth, height = pictureheight
+)
+
+ydistribution
+```
+
+Final Plot with Margins
+
+```{r}
+statsplotmodified <- statsplot + 
+  
+  scale_y_continuous(trans='log10', 
+                     labels = scales::label_log()) +
+  
+  theme(legend.position = "bottom", 
+        plot.title = element_blank(), 
+        plot.subtitle = element_blank())
+
+xdistributionmodified <- xdistributioncolor + 
+  
+  theme_void() + 
+  
+  theme(legend.position = "none", 
+        plot.title = element_blank(), 
+        panel.background = element_rect(fill = "white"),
+        plot.background  = element_rect(fill = "white"),
+        plot.subtitle = element_blank(), 
+        plot.margin = unit(c(0, 0, 0, 0.4), "in"))
+
+
+ydistributionmodified <- ydistribution + 
+  
+  scale_x_continuous(trans='log10')+
+  
+  coord_flip() + 
+  
+  theme_void() + 
+  
+  theme(plot.title = element_blank(), 
+        plot.subtitle = element_blank(),
+        panel.background = element_rect(fill = "white"),
+        plot.background  = element_rect(fill = "white"),
+        plot.margin = unit(c(0, 0, 1.3, 0), "in"))
+
+
+distfinal <- arrangeGrob(
+  xdistributionmodified,    # Top marginal plot (x-axis)
+  empty,          # Empty cell for spacing
+  statsplotmodified,        # Main scatterplot
+  ydistributionmodified,    # Right marginal plot (y-axis)
+  ncol = 2,      # Arrange in 2 columns
+  widths = c(4, 1), # Relative widths of columns (main plot wider)
+  heights = c(2, 3) # Relative heights of rows (main plot taller)
+)
+
+ggsave(
+  paste0(savepath,"/distribution/", sample, " Final distribution.png"), 
+  width = 8, height = 8, distfinal
+  )
+```
+
+Crack Correlation
+
+Read CSV file that contains crack lengths and acoustic energy
+
+```{r}
+cracklengths <- read.csv("./DataFiles/Crack Correlation/Surface Crack Lengths.csv")
+hardness <- read.csv("./DataFiles/Hardness/hardness correlation.csv")
+```
+
+Create Plot of AE vs Crack Length
+
+```{r}
+fitmodel <- lm(log(Acoustic.Energy) ~ log(Crack.Length), data = cracklengths)
+
+a_pl = exp(coef(fitmodel)[1])
+b_pl = coef(fitmodel)[2]
+r2_pl <- summary(fitmodel)$r.squared
+
+label_pl <- paste0(
+  "y = ", round(a_pl, 4), 
+  " * x^", round(b_pl, 4), 
+  "\nR² = ", round(r2_pl, 4))
+
+ggplot(data = cracklengths,
+       aes(x = Crack.Length,
+           y = Acoustic.Energy)) +
+  
+  geom_point() +
+  
+  stat_function(fun = function(x) a_pl * x ** b_pl,
+                linetype = "dashed",
+                linewidth = 1,
+                color = "red4") +
+  
+  annotate("text", 
+           x = max(cracklengths$Crack.Length) * 0.7, 
+           y = max(cracklengths$Acoustic.Energy) * 0.005, 
+           label = label_pl, hjust = 0.5, size = 5,
+           color = "black") +
+  
+  scale_y_continuous(trans = 'log10', labels = scales::label_log()) +
+  scale_x_continuous(trans = 'log10') +
+  
+  labs(y = "Acoustic Energy (aJ)",
+       x = "Crack Length (µm)") +
+  
+  theme_bw()
+
+ggsave(
+  paste0(savepath,"/correlation/Correlation Fit.png"), 
+  width = picturewidth, height = pictureheight
+)
+```
+
+Create Predictive Interval
+
+```{r}
+pimodel <- lm(log(Crack.Length) ~ log(Acoustic.Energy), data = cracklengths)
+
+a_pi = exp(coef(pimodel)[1])
+b_pi = coef(pimodel)[2]
+r2_pi <- summary(pimodel)$r.squared
+
+label_pi <- paste0(
+  "y = ", round(a_pi, 4), 
+  " * x^", round(b_pi, 4), 
+  "\nR² = ", round(r2_pi, 4))
+
+prediction <- exp(predict(pimodel, interval = "prediction"))
+
+SSAE = c(7160, 4170, 1e5)
+SSCL = c(54.0, 89.6)
+
+SSPI <- exp(predict(pimodel, newdata = data.frame(Acoustic.Energy = SSAE), interval = "prediction"))
+
+
+ggplot() +
+  
+  geom_point(data = cracklengths, aes(y = Crack.Length, x = Acoustic.Energy)) +
+  
+  geom_line(data = cbind(prediction,cracklengths), aes(x = Acoustic.Energy, y = upr), linetype = "longdash", color = "red4") +
+  geom_line(data = cbind(prediction,cracklengths), aes(x = Acoustic.Energy, y = fit)) +
+  geom_line(data = cbind(prediction,cracklengths), aes(x = Acoustic.Energy, y = lwr), linetype = "longdash", color = "red4") +
+  
+  # geom_segment(data = SSPI, aes(x = SSAE[1],
+  #                               xend = SSAE[1],
+  #                               y = SSPI[1,2],
+  #                               yend = SSPI[1,3]),
+  #              color = "green4") +
+  # 
+  # geom_point(data = cbind(SSAE, SSCL),
+  #            aes(x = SSAE[1],
+  #                y = SSCL[1]),
+  #            color = "green4",
+  #            size = 3) +
+  # 
+  # annotate("text",
+  #          x = SSAE[1] + 3000,
+  #          y = SSPI[1,2] - 7,
+  #          label = "Sample 1",
+  #          color = "green4") +
+  # 
+  # geom_segment(data = SSPI, aes(x = SSAE[2],
+  #                               xend = SSAE[2],
+  #                               y = SSPI[2,2],
+  #                               yend = SSPI[2,3]),
+  #              color = "blue") +
+  # 
+  # geom_point(data = cbind(SSAE, SSCL),
+  #            aes(x = SSAE[2],
+  #                y = SSCL[2]),
+  #            color = "blue",
+  #            size = 3) +
+  # 
+  # annotate("text",
+  #          x = SSAE[2]+1000,
+  #          y = SSPI[2,3] + 30,
+  #          label = "Sample 2",
+  #          color = "blue") +
+  # 
+  # geom_segment(data = SSPI, aes(x = SSAE[3],
+  #                               xend = SSAE[3],
+  #                               y = SSPI[3,2],
+  #                               yend = SSPI[3,3]),
+  #            color = "red") +
+  # 
+  # annotate("text",
+  #          x = SSAE[3] + 75000,
+  #          y = SSPI[3,2] - 15,
+  #          label = "Example",
+  #          color = "red") +
+  
+  # annotate("text", 
+  #        y = max(cracklengths$Crack.Length) * 0.7, 
+  #        x = max(cracklengths$Acoustic.Energy) * 0.005, 
+  #        label = label_pi, hjust = 0.5, size = 5,
+  #        color = "black") +
+  
+  scale_x_continuous(trans = "log10", labels = scales::label_log()) +
+  scale_y_continuous(trans = "log10") +
+  
+  labs(y = "Crack Length d (µm)", 
+       x = "Acoustic Energy (aJ)") +
+  
+  theme_bw()
+
+ggsave(
+  paste0(savepath,"/correlation/Correlation PI 3.png"), 
+  width = picturewidth, height = pictureheight
+)
+```
+
+Functions for Predictive Index
+
+PI Function
+
+```{r}
+Pindex <- function(data, 
+                   x, 
+                   y, 
+                   fittype = "power",
+                   xlab = "X Label", 
+                   ylab = "Y Label",
+                   xlinear = FALSE,
+                   ylinear = TRUE,
+                   xlablog = TRUE,
+                   ylablog = TRUE,
+                   annolow = TRUE) 
+  {
+  
+  xname <- deparse(substitute(x))
+  yname <- deparse(substitute(y))
+  
+  xrange = range(data[[xname]])
+  yrange = range(data[[yname]])
+  
+  points = data.frame(seq(xrange[1], xrange[2], length.out = 1000))
+  names(points) <- xname
+  
+  curve <- switch(fittype,
+                  "exp" = {
+                    
+                    tempmodel <- lm(
+                      reformulate(xname,
+                                  paste0("log(", yname, ")")),
+                      data = data
+                    )
+                    
+                    tempprediction <- exp(predict(tempmodel, 
+                                                  newdata = points, 
+                                                  interval = "prediction")
+                    )
+                    
+                    a <- exp(coef(tempmodel)[1])
+                    b <- coef(tempmodel)[2]
+                    r2 <- summary(tempmodel)$r.squared
+                    
+                    label <- paste0(
+                      "y = ", round(a, 4),
+                      " * e^", round(b, 4),
+                      " * x",
+                      "\nR² = ", round(r2, 4))
+                    
+                  },
+                  
+                  "linear" = {
+                    
+                    tempmodel <- lm(
+                      reformulate(xname, yname),
+                      data = data
+                    )
+                    
+                    tempprediction <- predict(tempmodel, 
+                                              newdata = points, 
+                                              interval = "prediction")
+                    
+                    a <- coef(tempmodel)[2]
+                    b <- coef(tempmodel)[1]
+                    r2 <- summary(tempmodel)$r.squared
+                    
+                    label <- paste0(
+                      "y = ", round(a, 4),
+                      " * x + ", round(b, 4),
+                      "\nR² = ", round(r2, 4))
+                    
+                  },
+                  
+                  "power" = {
+                    
+                    tempmodel <- lm(
+                      reformulate(paste0("log(", xname, ")"),
+                                  paste0("log(", yname, ")")),
+                      data = data
+                    )
+                    
+                    tempprediction <- exp(predict(tempmodel, 
+                                                  newdata = points, 
+                                                  interval = "prediction")
+                    )
+                    
+                    a <- exp(coef(tempmodel)[1])
+                    b <- coef(tempmodel)[2]
+                    r2 <- summary(tempmodel)$r.squared
+                    
+                    label <- paste0(
+                      "y = ", round(a, 4),
+                      " * x^", round(b, 4),
+                      "\nR² = ", round(r2, 4))
+                    
+                  }
+                  
+                  )
+
+  
+  if(annolow) {labscale = 1/4} else {labscale = 3/4}
+  
+  if(xlinear){
+    xlabelpos <- 13 * ((xrange[2] - xrange[1]) / 16) + xrange[1]
+  } else {
+    xlabelpos <- 10 ** ((13 * (log10(xrange[2]) - log10(xrange[1])) / 16) + log10(xrange[1]))
+  }
+
+  if(ylinear){
+    ylabelpos <- labscale * (yrange[2] - yrange[1]) + yrange[1]
+  } else {
+    ylabelpos <- 10 ** (labscale * (log10(yrange[2]) - log10(yrange[1])) + log10(yrange[1]))
+  }
+  
+  fitpoints = cbind(points, tempprediction)
+  
+  p <- ggplot() +
+    
+    geom_point(data = data, aes(x = {{x}}, y = {{y}})) +
+    
+    geom_line(data = fitpoints, aes(x = {{x}}, y = upr), linetype = "longdash", color = "red4") +
+    
+    geom_line(data = fitpoints, aes(x = {{x}}, y = fit), linetype = "longdash", color = "black") +
+    
+    geom_line(data = fitpoints, aes(x = {{x}}, y = lwr), linetype = "longdash", color = "red4") +
+    
+    annotate("text", x = xlabelpos, y = ylabelpos, label = label, 
+             hjust = 0.5, vjust = 0.5, size = 5, color = "black") +
+    
+    labs(x = xlab, y = ylab) +
+    
+    theme_bw()
+  
+  
+    
+  if (xlablog && !xlinear) {
+    p <- p +
+      scale_x_continuous(trans = "log10", label = scales::label_log())
+    
+  } else if(!xlinear){
+    p <- p +
+      scale_x_continuous(trans = "log10")
+  }
+  
+  if (ylablog && !ylinear) {
+    p <- p +
+      scale_y_continuous(trans = "log10", label = scales::label_log())
+    
+  } else if(!ylinear){
+    p <- p +
+      scale_y_continuous(trans = "log10")
+  }
+  
+  
+  
+  ggsave(
+    paste0(savepath,"/intervals/", xname, "-", yname, ".png"),
+    width = picturewidth, height = pictureheight
+  )
+  
+  p
+  
+}
+```
+
+Precision of Interval Function
+
+```{r}
+PIprecision <- function(data = hardness, 
+                        x = Acoustic.Energy, 
+                        y = Hardness,
+                        xlab = "X Label",
+                        linear = FALSE,
+                        lablog = TRUE) 
+  {
+  
+  xname <- deparse(substitute(x))
+  yname <- deparse(substitute(y))
+  
+  logpoints = 10^(seq(log10(min(data[[xname]])),log10(max(data[[xname]])), by = 0.01))
+
+  tempmodel <- lm(
+    reformulate(paste0("log(", xname, ")"),
+                paste0("log(", yname, ")")),
+    data = data
+  )
+  
+  newdata <- setNames(
+    data.frame(logpoints),
+    xname
+  )
+
+  tempprediction <- exp(
+    predict(tempmodel, 
+            newdata, 
+            interval = "prediction")
+  )
+  
+  tempinterval <- as.data.frame(tempprediction) %>% mutate(deltad = (upr-lwr)/fit)
+  
+  p <- ggplot(data = cbind(tempinterval,logpoints),
+         aes(
+           x = logpoints,
+           y = deltad)) +
+    
+    geom_path() +
+    
+    scale_y_continuous(label = scales::percent) +
+    
+    labs(y = "∆d / d fit", x = xlab) +
+    
+    theme_bw()
+  
+  if (lablog && !linear) {
+    p <- p +
+      scale_x_continuous(trans = "log10", label = scales::label_log())
+    
+  } else if(!linear){
+    p <- p +
+      scale_x_continuous(trans = "log10")
+  }
+  
+    ggsave(
+      paste0(savepath,"/interval precision/", xname, "-", yname, ".png"),
+      width = picturewidth, height = pictureheight
+      )
+    
+    p
+}
+```
+
+PI Analysis, assuming various fits
+
+X = AE
+
+```{r}
+Pindex(data = hardness, 
+       x = Acoustic.Energy, 
+       y = Hardness, 
+       fittype = "power",
+       xlab = "Acoustic Energy (aJ)", 
+       ylab = "Hardness (GPa)",
+       xlinear = FALSE,
+       xlablog = TRUE,
+       ylinear = TRUE,
+       ylablog = FALSE,
+       annolow = FALSE)
+
+PIprecision(hardness, 
+            Acoustic.Energy, 
+            Hardness, 
+            "Acoustic Energy (aJ)",
+            linear = FALSE,
+            lablog = TRUE)
+```
+
+```{r}
+Pindex(data = hardness, 
+       x = Acoustic.Energy, 
+       y = Crack.Length, 
+       fittype = "power",
+       xlab = "Acoustic Energy (aJ)", 
+       ylab = "Crack Length (µm)", 
+       xlinear = FALSE,
+       xlablog = TRUE,
+       ylinear = FALSE, 
+       ylablog = FALSE,
+       annolow = TRUE)
+
+PIprecision(hardness, 
+            Acoustic.Energy, 
+            Crack.Length, 
+            "Acoustic Energy (aJ)",
+            linear = FALSE,
+            lablog = TRUE)
+```
+
+```{r}
+Pindex(data = hardness, 
+       x = Acoustic.Energy, 
+       y = Load, 
+       fittype = "power",
+       xlab = "Acoustic Energy (aJ)", 
+       ylab = "Load (N)", 
+       xlinear = FALSE,
+       xlablog = TRUE,
+       ylinear = FALSE, 
+       ylablog = FALSE,
+       annolow = TRUE)
+
+PIprecision(hardness, 
+            Acoustic.Energy, 
+            Load, 
+            "Acoustic Energy (aJ)",
+            linear = FALSE,
+            lablog = TRUE)
+```
+
+X = Hardness
+
+```{r}
+Pindex(data = hardness, 
+       x = Hardness, 
+       y = Acoustic.Energy, 
+       fittype = "power",
+       xlab = "Hardness (GPa)", 
+       ylab = "Acoustic Energy (aJ)", 
+       xlinear = TRUE, 
+       xlablog = FALSE,
+       ylinear = FALSE,
+       ylablog = TRUE,
+       annolow = FALSE)
+
+PIprecision(hardness, 
+            Hardness, 
+            Acoustic.Energy, 
+            "Hardness (GPa)", 
+            linear = TRUE,
+            lablog = FALSE) 
+```
+
+```{r}
+Pindex(data = hardness, 
+       x = Hardness, 
+       y = Crack.Length, 
+       fittype = "power",
+       xlab = "Hardness (GPa)",
+       ylab = "Crack Length (µm)", 
+       xlinear = TRUE,
+       xlablog = FALSE,
+       ylinear = FALSE,
+       ylablog = FALSE,
+       annolow = FALSE)
+
+PIprecision(hardness, 
+            Hardness, 
+            Crack.Length, 
+            "Hardness (GPa)", 
+            linear = TRUE,
+            lablog = FALSE) 
+```
+
+```{r}
+Pindex(data = hardness, 
+       x = Hardness, 
+       y = Load,
+       fittype = "power",
+       xlab = "Hardness (GPa)", 
+       ylab = "Load (N)", 
+       xlinear = TRUE,
+       xlablog = FALSE,
+       ylinear = FALSE, 
+       ylablog = FALSE,
+       annolow = FALSE)
+
+PIprecision(hardness, 
+            Hardness, 
+            Load, 
+            "Hardness (GPa)", 
+            linear = TRUE,
+            lablog = FALSE) 
+```
+
+X = Crack Length
+
+```{r}
+Pindex(data = hardness, 
+       x = Crack.Length, 
+       y= Hardness, 
+       fittype = "power",
+       xlab = "Crack Length (µm)", 
+       ylab = "Hardness (GPa)", 
+       xlinear = FALSE, 
+       xlablog = FALSE,
+       ylinear = FALSE,
+       ylablog = FALSE,
+       annolow = FALSE)
+
+PIprecision(hardness, 
+            Crack.Length, 
+            Hardness, 
+            "Crack Length (µm)", 
+            linear = FALSE,
+            lablog = FALSE)
+```
+
+```{r}
+Pindex(data = hardness, 
+       x = Crack.Length,
+       y = Acoustic.Energy, 
+       fittype = "power",
+       xlab = "Crack Length (µm)", 
+       ylab = "Acoustic Energy (aJ)", 
+       xlinear = FALSE, 
+       xlablog = FALSE, 
+       ylinear = FALSE,
+       ylablog = TRUE,
+       annolow = TRUE)
+
+PIprecision(hardness, 
+            Crack.Length, 
+            Acoustic.Energy, 
+            "Crack Length (µm)", 
+            linear = FALSE,
+            lablog = FALSE)
+```
+
+```{r}
+Pindex(data = hardness, 
+       x = Crack.Length,
+       y = Load, 
+       fittype = "power",
+       xlab = "Crack Length (µm)", 
+       ylab = "Load (N)", 
+       xlinear = TRUE, 
+       xlablog = FALSE, 
+       ylinear = TRUE,
+       ylablog = FALSE,
+       annolow = TRUE)
+
+PIprecision(hardness, 
+            Crack.Length, 
+            Load, 
+            "Crack Length (µm)", 
+            linear = TRUE,
+            lablog = FALSE)
+```
+
+X = Load
+
+```{r}
+Pindex(data = hardness, 
+       x = Load,
+       y = Acoustic.Energy, 
+       fittype = "power",
+       xlab = "Load (N)", 
+       ylab = "Acoustic Energy (aJ)", 
+       xlinear = TRUE, 
+       xlablog = FALSE, 
+       ylinear = FALSE,
+       ylablog = TRUE,
+       annolow = TRUE)
+
+PIprecision(hardness, 
+            Load, 
+            Acoustic.Energy, 
+            "Load (N)", 
+            linear = TRUE,
+            lablog = FALSE)
+```
+
+```{r}
+Pindex(data = hardness, 
+       x = Load,
+       y = Crack.Length, 
+       fittype = "power",
+       xlab = "Load (N)", 
+       ylab = "Crack Length (µm)", 
+       xlinear = TRUE, 
+       xlablog = FALSE, 
+       ylinear = FALSE,
+       ylablog = FALSE,
+       annolow = TRUE)
+
+PIprecision(hardness, 
+            Load, 
+            Crack.Length, 
+            "Load (N)", 
+            linear = TRUE,
+            lablog = FALSE)
+```
+
+```{r}
+Pindex(data = hardness, 
+       x = Load,
+       y = Hardness, 
+       fittype = "power",
+       xlab = "Load (N)", 
+       ylab = "Hardness (GPa)", 
+       xlinear = TRUE, 
+       xlablog = FALSE, 
+       ylinear = TRUE,
+       ylablog = FALSE,
+       annolow = FALSE)
+
+PIprecision(hardness, 
+            Load, 
+            Hardness, 
+            "Load (N)", 
+            linear = TRUE,
+            lablog = FALSE)
+```
+
+Hardness Analysis
+
+Indent Size Effect Demonstration
+
+```{r}
+hardness <- read.csv("./DataFiles/Hardness/hardness correlation.csv")
+
+avehard <- hardness %>% group_by(Load) %>% summarize(mean = mean(Hardness))
+
+ggplot() +
+  
+  geom_point(data = hardness, 
+             aes(
+               x = Load, 
+               y = Hardness)) +
+  
+  geom_line(data = avehard, 
+            aes(
+              x = Load, 
+              y = mean), 
+            color = "red4") +
+  
+  geom_point(data = avehard, 
+             aes(
+               x = Load, 
+               y = mean), 
+             color = "red4", 
+             size = 3) +
+  
+  labs(y = "Hardness (GPa)", 
+       x = "Load (N)") +
+  
+  theme_bw()
+
+ggsave(
+  paste0(savepath,"/hardness/indentsizeeffect.png"), 
+  width = picturewidth, height = pictureheight
+)
+```
+
+Serial Sectioning
+
+Generate and Condition Data
+
+```{r}
+SSnoiseoffset = 200 #in aJ
+
+SSdatamaster <- filestolist(folderdir = c("./DataFiles/4 Peak 2", "./DataFiles/5 Peak 2"),
+                            loadstart = teststartload, 
+                            plotcount = 100, 
+                            indent = 1,
+                            uniquenames = TRUE)
+
+SSdatalist <- SSdatamaster[[2]]
+SSdatalistclean <- SSdatamaster[[3]]
+SSselecteddata <- SSdatamaster[[4]]
+
+SSdatacond <- makedfcond(SSdatalist, SSdatalistclean, noiseoff = SSnoiseoffset, loadstart = teststartload)
+
+SSdatalistclean <- map2(SSdatalistclean, SSdatacond, readjust)
+
+SSindentdf <- reindex(do.call(rbind, lapply(SSdatacond, `[[`, "indentdfrow")))
+
+SSpeaksdf <- makepeaksdf(SSdatacond)
+```
+
+Graph Data
+
+```{r}
+plotlist = names(SSdatalistclean)#c("4 Peak 2/Test 1", "4 Peak 2/Test 5")
+
+
+#scales second axis properly such that max load and max AE are at same height
+scale = 
+  (vapply(SSdatalistclean[plotlist], function(df) max(df[[5]]), numeric(1)) -
+  vapply(SSdatacond[plotlist], function(df) df$AEnoise, numeric(1))) /
+  vapply(SSdatalistclean[plotlist], function(df) max(df[[3]]), numeric(1))
+
+walk(plotlist, function(indent) {
+  
+  p <- ggplot() +
+    
+    geom_path(data = SSdatalistclean[[indent]],
+              aes(
+                x = Depth..µm.,
+                y = Acoustic..aJ. - SSdatacond[[indent]]$AEnoise),
+              color = "black") +
+    
+    geom_path(data = SSdatalistclean[[indent]], 
+              aes(
+                x=Depth..µm., 
+                y=Load..N. * scale[[indent]]), 
+              color = "red2") +
+    
+    geom_hline(
+      yintercept = 
+        SSdatacond[[indent]]$Noisefloor - 
+        SSdatacond[[indent]]$AEnoise, 
+      linetype="longdash", 
+      col = 'black')+
+  
+    annotate("text", 
+             x = .75, 
+             y = SSdatacond[[indent]]$Noisefloor - SSdatacond[[indent]]$AEnoise, 
+             label = "Noise Floor", 
+             vjust = -0.75) +
+    
+    coord_cartesian(ylim = c(0, NA)) +
+    
+    scale_y_continuous(name = "Acoustic Energy (aJ)", 
+                       sec.axis = sec_axis(~. * 1 / scale[[indent]], name = "Load (N)")) +
+    
+    labs(x = "Depth (µm)") +
+    
+    theme_bw() +
+    theme(axis.title.y.right = element_text(color = "red2"))
+  
+  ggsave(
+    paste0(savepath, "/serialsection/",indent," AELoad Overlay.png"), 
+    plot = p,
+    width = picturewidth, height = pictureheight
+  )
+}
+)
+```
+
+Alumina Testing
+
+```{r}
+ALnoiseoffset = 200 #in aJ
+
+ALdatamaster <- filestolist(folderdir = c("./DataFiles/Alumina 5N 5Nmin", "./DataFiles/Alumina 5N 20Nmin", "./DataFiles/Alumina 20N 5Nmin", "./DataFiles/Alumina 20N 20Nmin"),
+                            loadstart = teststartload, 
+                            plotcount = 100, 
+                            indent = 1,
+                            uniquenames = TRUE)
+
+ALdatalist <- ALdatamaster[[2]]
+ALdatalistclean <- ALdatamaster[[3]]
+ALselecteddata <- ALdatamaster[[4]]
+
+ALdatacond <- makedfcond(ALdatalist, ALdatalistclean, noiseoff = ALnoiseoffset, loadstart = teststartload)
+
+ALdatalistclean <- map2(ALdatalistclean, ALdatacond, readjust)
+
+ALindentdf <- reindex(do.call(rbind, lapply(ALdatacond, `[[`, "indentdfrow")))
+
+ALpeaksdf <- makepeaksdf(ALdatacond)
+
+ALlegend = c("20N at 20N/min", "20N at 5N/min", "5N at 20N/min", "5N at 5N/min")
+names(ALlegend) <- unique(ALpeaksdf$Source)
+```
+
+```{r}
+ggplot(ALpeaksdf) +
+  geom_histogram(aes(x = Load), fill = "darkgrey", binwidth = 0.25) +
+  geom_density(aes(x = Load, y = after_stat(scaled) * 10)) +
+  facet_wrap(~ Source, scales = "free", labeller = as_labeller(ALlegend)) +
+  labs(x = "Load (N)", 
+       y = "Count") +
+  theme_bw()
+
+ggsave(
+  paste0(savepath,"/ALdistribution/", sample, " Load distribution.png"), 
+  width = picturewidth, height = pictureheight
+)
+```
+
+```{r}
+ggplot(ALpeaksdf) +
+  geom_histogram(aes(x = Depth), fill = "darkgrey", binwidth = 0.25) +
+  geom_density(aes(x = Depth, y = after_stat(scaled) * 15)) +
+  facet_wrap(~ Source, scales = "free", labeller = as_labeller(ALlegend)) +
+  labs(x = "Depth (μm)", 
+       y = "Count") +
+  theme_bw()
+
+ggsave(
+  paste0(savepath,"/ALdistribution/", sample, " Depth distribution.png"), 
+  width = picturewidth, height = pictureheight
+)
+```
+
+```{r}
+ALgroups = 20
+ALtransparency = 0.2
+ALcolors = colpal(ALgroups)
+
+split_df <- split(ALpeaksdf, ALpeaksdf$Source)
+
+ALstatslist <- do.call(
+  rbind,
+  Map(
+    function(df, src) {
+      out <- makestats(df)
+      out$Source <- src
+      out
+    },
+    split_df,
+    names(split_df)
+  )
+)
+
+
+
+ggplot() +
+  
+  geom_point(data = ALpeaksdf %>% filter(PeakNumber <= ALgroups), 
+             aes(
+               x = Load, 
+               y = AE,
+               shape = factor(PeakNumber),
+               fill = factor(PeakNumber)),
+             color = "black",
+             alpha = ALtransparency,
+             size = 2) +
+
+  geom_point(data = ALstatslist %>% filter(PeakNumber <= ALgroups),
+             aes(
+               x = meanLoad,
+               y = meanAE,
+               shape = factor(PeakNumber),
+               fill = factor(PeakNumber)),
+             color = "black",
+             size = 3) +
+
+  geom_errorbarh(data = ALstatslist %>% filter(PeakNumber <= ALgroups),
+                aes(
+                  y = meanAE,
+                  xmin = meanLoad - sdload,
+                  xmax = meanLoad + sdload,
+                )) +
+
+  scale_shape_manual(name = paste0("Peak", "\n", "Number"), values = rep(shapes_3, length.out = ALgroups)) +
+  scale_fill_manual(name = paste0("Peak", "\n", "Number"), values = ALcolors) +
+  
+  facet_wrap(~ Source, scales = "free", labeller = as_labeller(ALlegend)) +
+
+  labs(x = "Load (N)",
+       y = "Acoustic Energy (aJ)") +
+  # 
+  # coord_cartesian(xlim = c(xmin, xmax), ylim = c(ymin, ymax)) +
+
+  scale_y_continuous(trans = "log10", labels = scales::number) +
+  
+  theme_bw()
+
+ggsave(
+  paste0(savepath,"/ALfirstpeaksplot/", sample, " First Peaks Average.png"), 
+  width = picturewidth, height = pictureheight
+)
+```
+
+```{r}
+ALsourcenum = length(unique(ALpeaksdf$Source))
+ALtransparency2 = 0.25
+ALcolors2 = colpal(ALsourcenum)
+
+ALoptimstats <- ALpeaksdf %>% 
+  group_by(Source) %>% 
+  summarize(meanload = mean(Load), 
+            meandepth = mean(Depth), 
+            meanAE = mean(AE))
+
+ggplot() +
+  
+  geom_point(data = ALpeaksdf,
+             aes(
+               x = Load,
+               y = AE,
+               shape = factor(Source),
+               fill = factor(Source)),
+             color = "black",
+             alpha = ALtransparency2,
+             size = 2) +
+  
+  geom_point(data = ALoptimstats,
+             aes(
+               x = meanload,
+               y = meanAE,
+               shape = factor(Source),
+               fill = factor(Source)),
+             size = 4) +
+  
+  geom_mark_rect(data = ALpeaksdf,
+                 aes(
+                   x = Load,
+                   y = AE,
+                   fill = factor(Source),
+                   color = factor(Source)),
+                 alpha = ALtransparency2/4, 
+                 radius = 0, 
+                 expand = 0.02) +
+
+  scale_shape_manual(name = "Source", values = rep(shapes_3, length.out = ALsourcenum), labels = ALlegend) +
+  scale_fill_manual(name = "Source", values = ALcolors2, labels = ALlegend) +
+  scale_color_manual(name = "Source", values = ALcolors2, labels = ALlegend) +
+
+  labs(x = "Load (N)",
+       y = "Acoustic Energy (aJ)") +
+  # 
+  # coord_cartesian(xlim = c(xmin, xmax), ylim = c(ymin, ymax)) +
+
+  scale_y_continuous(trans = "log10", labels = scales::number) +
+  
+  theme_bw()
+
+ggsave(
+  paste0(savepath,"/ALfirstpeaksplot/", sample, " First Peaks Average 2.png"), 
+  width = picturewidth, height = pictureheight
+)
+
+
+
+ggplot() +
+  
+  geom_point(data = ALpeaksdf,
+             aes(
+               x = Depth,
+               y = AE,
+               shape = factor(Source),
+               fill = factor(Source)),
+             color = "black",
+             alpha = ALtransparency2,
+             size = 2) +
+               
+  geom_point(data = ALoptimstats,
+             aes(
+               x = meandepth,
+               y = meanAE,
+               shape = factor(Source),
+               fill = factor(Source)),
+             size = 4) +
+  
+  geom_mark_rect(data = ALpeaksdf,
+                 aes(
+                   x = Depth,
+                   y = AE,
+                   fill = factor(Source),
+                   color = factor(Source)),
+                 alpha = ALtransparency2/4, 
+                 radius = 0, 
+                 expand = 0.02) +
+
+  scale_shape_manual(name = "Source", values = rep(shapes_3, length.out = ALsourcenum), labels = ALlegend) +
+  scale_fill_manual(name = "Source", values = ALcolors2, labels = ALlegend) +
+  scale_color_manual(name = "Source", values = ALcolors2, labels = ALlegend) +
+
+  labs(x = "Depth (μm)",
+       y = "Acoustic Energy (aJ)") +
+  # 
+  # coord_cartesian(xlim = c(xmin, xmax), ylim = c(ymin, ymax)) +
+
+  scale_y_continuous(trans = "log10", labels = scales::number) +
+  
+  theme_bw()
+
+ggsave(
+  paste0(savepath,"/ALfirstpeaksplot/", sample, " First Peaks Average 2 Depth.png"), 
+  width = picturewidth, height = pictureheight
+)
+```
+
+Sensor Placement
+
+```{r}
+posnoiseoffset = 100 #in aJ
+
+posdatamaster <- filestolist(folderdir = c("./DataFiles/New Sensor Testing", "./DataFiles/Under Sensor No Puck", "./DataFiles/Under Sensor Puck"),
+                            loadstart = teststartload, 
+                            plotcount = 100, 
+                            indent = 1,
+                            uniquenames = TRUE)
+
+posdatalist <- posdatamaster[[2]]
+posdatalistclean <- posdatamaster[[3]]
+posselecteddata <- posdatamaster[[4]]
+
+posdatacond <- makedfcond(posdatalist, posdatalistclean, noiseoff = posnoiseoffset, loadstart = teststartload)
+
+posdatalistclean <- map2(posdatalistclean, posdatacond, readjust)
+
+posindentdf <- reindex(do.call(rbind, lapply(posdatacond, `[[`, "indentdfrow")))
+
+pospeaksdf <- makepeaksdf(posdatacond)
+```
+
+```{r}
+plotlist = names(posdatalistclean)#c("4 Peak 2/Test 1", "4 Peak 2/Test 5")
+
+walk(plotlist, function(indent) {
+  
+  p <- ggplot() +
+    
+    geom_path(data = posdatalistclean[[indent]],
+              aes(
+                x = Load..N.,
+                y = Acoustic..aJ. - posdatacond[[indent]]$AEnoise),
+              color = "black") +
+    
+    geom_hline(
+      yintercept = 
+        posdatacond[[indent]]$Noisefloor - 
+        posdatacond[[indent]]$AEnoise, 
+      linetype="longdash", 
+      col = 'black')+
+  
+    annotate("text", 
+             x = .75, 
+             y = posdatacond[[indent]]$Noisefloor - posdatacond[[indent]]$AEnoise, 
+             label = "Noise Floor", 
+             vjust = -0.75) +
+    
+    coord_cartesian(ylim = c(0, NA)) +
+    
+    labs(x = "Load (N)", y = "Acoustic Energy (aJ)") +
+    
+    theme_bw()
+  
+  ggsave(
+    paste0(savepath, "/sensorposition/",indent," AELoad Overlay.png"), 
+    plot = p,
+    width = picturewidth, height = pictureheight)
+  }
+  )
+```
+
+```{r}
+possummary <- aggregate(posindentdf$first_load, list(posindentdf$Source), mean)
+```
+
+Export Data
+
+```{r}
+exportcsv <- function(df){
+  write.csv(df, paste0("Export/",deparse(substitute(df)),".csv"), row.names = FALSE)
+  }
+```
+
+```{r}
+exportcsv(ALindentdf)
+exportcsv(SSindentdf)
+exportcsv(indentdf)
+
+exportcsv(ALpeaksdf)
+exportcsv(SSpeaksdf)
+exportcsv(peaksdf)
+```
